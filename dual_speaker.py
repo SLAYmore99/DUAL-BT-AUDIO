@@ -16,7 +16,7 @@ volume, mute, on/off, channel (stereo / left / right / mono / swap) and delay.
 Windows 10/11. Run DualSpeaker.exe, or with Python 3.9+:  pip install soundcard numpy
 Ideas credited in README.md (erdongshuiyang/DualSpeaker, MIT).
 """
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import ctypes
 import json
@@ -871,15 +871,14 @@ def start_web(port=WEB_PORT):
 
 def open_window(url):
     """Open the UI as its own app window (Microsoft Edge app mode, built into Windows);
-    fall back to the default browser."""
+    fall back to the default browser. Uses the person's existing Edge profile: a fresh
+    profile makes Edge auto sign-in to the Microsoft account and pop up a sync notice."""
     if sys.platform == "win32":
-        profile = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "DualSpeaker", "window")
         for base in (os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramFiles", "")):
             edge = os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")
             if base and os.path.exists(edge):
                 try:
-                    subprocess.Popen([edge, f"--app={url}", "--window-size=1000,900", f"--user-data-dir={profile}",
-                                      "--no-first-run", "--no-default-browser-check"])
+                    subprocess.Popen([edge, f"--app={url}", "--window-size=1000,900"])
                     return
                 except OSError:
                     pass
