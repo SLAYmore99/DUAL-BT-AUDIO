@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+dual_speaker_settings.json
+.pytest_cache/
