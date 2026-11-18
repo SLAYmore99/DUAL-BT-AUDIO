@@ -16,6 +16,8 @@ volume, mute, on/off, channel (stereo / left / right / mono / swap) and delay.
 Windows 10/11. Run DualSpeaker.exe, or with Python 3.9+:  pip install soundcard numpy
 Ideas credited in README.md (erdongshuiyang/DualSpeaker, MIT).
 """
+__version__ = "0.3.0"
+
 import ctypes
 import json
 import os
@@ -518,7 +520,7 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--dim);font-size:13px;u
 .sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s}
 .sw.on{background:var(--acc)}.sw.on::after{left:21px}
 </style></head><body><div class="wrap">
-<header><div class="logo">2</div><h1>Dual Speaker</h1><div class="grow"></div>
+<header><div class="logo">2</div><h1>Dual Speaker <span class="small" id="ver"></span></h1><div class="grow"></div>
 <button id="quit" class="small" style="display:none" title="Stop audio and close the app">Quit</button>
 <button id="toggle" class="primary">Start</button></header>
 <div id="status" class="status"></div>
@@ -569,7 +571,7 @@ function build(){
 function render(){
  const t=$("toggle");t.textContent=S.running?"Stop":"Start";t.classList.toggle("stop",S.running);
  const st=$("status");st.textContent=S.status;st.classList.toggle("bad",/^Problem|echo|Pick/.test(S.status));
- $("quit").style.display=S.local?"":"none";
+ $("quit").style.display=S.local?"":"none";$("ver").textContent=S.version?("v"+S.version):"";
  $("hint").style.display=S.needs_cable?"":"none";
  $("calmsg").textContent=S.calib;$("cal").disabled=S.calibrating;$("cal").textContent=S.calibrating?"Calibrating…":"Auto-calibrate delay";
  $("sync").classList.toggle("on",S.sync_test);
@@ -672,7 +674,7 @@ class Controller:
         levels = [0.0] * N_OUT
         for w in self.engine.workers:
             levels[w.idx] = round(float(getattr(w, "level", 0.0)), 3)
-        pub.update(levels=levels, local=local, remote=self.remote, calibrating=self.engine.calibrating,
+        pub.update(version=__version__, levels=levels, local=local, remote=self.remote, calibrating=self.engine.calibrating,
                    needs_cable=not any("CABLE Output" in k for k in self.sources),
                    devices={"sources": list(self.sources), "speakers": list(self.speakers), "mics": list(self.mics)})
         return pub
