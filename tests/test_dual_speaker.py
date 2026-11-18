@@ -103,6 +103,7 @@ sys.modules["soundcard"] = fake_sc
 import dual_speaker as ds  # noqa: E402
 
 SR, BLOCK = ds.SR, ds.BLOCK
+REAL_SAVE = ds.save_settings
 
 
 def reset_state():
@@ -265,7 +266,7 @@ def test_phone_page_script_is_valid_js():
     node = shutil.which("node")
     if not node:
         return
-    js = re.search(r"<script>(.*)</script>", ds.WEB_PAGE, re.S).group(1)
+    js = re.search(r"<script>(.*)</script>", ds.UI_PAGE, re.S).group(1)
     path = os.path.join(tempfile.mkdtemp(), "page.js")
     open(path, "w").write(js)
     r = subprocess.run([node, "--check", path], capture_output=True, text=True)
@@ -350,13 +351,13 @@ def test_threaded_engine_with_fake_devices():
 
 
 def test_web_remote():
-    reset_state()
+    make_controller()
     srv = ds.start_web(port=0)
     port = srv.server_address[1]
     base = f"http://127.0.0.1:{port}"
     try:
         html = urllib.request.urlopen(base + "/").read().decode()
-        assert "Room Speakers" in html and "Auto-calibrate" in html
+        assert "Dual Speaker" in html and "Auto-calibrate" in html
 
         def post(path, body):
             req = urllib.request.Request(base + path, json.dumps(body).encode(),
@@ -368,12 +369,15 @@ def test_web_remote():
         assert post("/set", {"path": ["outputs", 0, "mode"], "value": "Bogus"}) == 200
         assert post("/set", {"path": ["outputs", 7, "volume"], "value": 5}) == 200
         assert post("/set", {"path": ["master"], "value": "abc"}) == 200
+        assert post("/set", {"path": ["outputs", 0, "device"], "value": "JBL Flip 5"}) == 200
         assert post("/cmd", {"cmd": "calibrate"}) == 200
         st = json.loads(urllib.request.urlopen(base + "/state").read())
         assert st["outputs"][1]["volume"] == 150
         assert st["outputs"][0]["delay"] == 450
         assert st["outputs"][0]["mode"] == "Stereo"
-        assert ds.state["pending"] == "calibrate"
+        assert st["outputs"][0]["device"] == "JBL Flip 5"
+        assert "JBL Flip 5" in st["devices"]["speakers"] and st["local"] is True
+        assert "Press Start" in st["calib"]
     finally:
         srv.shutdown()
 
@@ -385,7 +389,7 @@ def test_settings_roundtrip(tmp_path=None):
     with ds.state_lock:
         ds.state["outputs"][1].update(device="boAt Stone 350", delay=120, mode="Right channel only")
         ds.state["mic"] = "Microphone Array (Realtek)"
-    ds.save_settings(path)
+    REAL_SAVE(path)
     reset_state()
     ds.load_settings(path)
     assert ds.state["outputs"][1]["delay"] == 120
@@ -393,123 +397,133 @@ def test_settings_roundtrip(tmp_path=None):
     assert ds.state["mic"] == "Microphone Array (Realtek)"
 
 
-# ----------------------------------------------------------------- fake tkinter for the window
-class _Var:
-    def __init__(self, value=None):
-        self.v = value
-
-    def get(self):
-        return self.v
-
-    def set(self, v):
-        self.v = v
-
-
-class _Widget:
-    def __init__(self, *a, **kw):
-        self.kw = dict(kw)
-        self.binds = {}
-        _Widget.all.append(self)
-
-    def grid(self, **kw):
-        pass
-
-    def bind(self, ev, fn):
-        self.binds[ev] = fn
-
-    def config(self, **kw):
-        self.kw.update(kw)
-
-    configure = config
-
-    def __setitem__(self, k, v):
-        self.kw[k] = v
-
-    def __getitem__(self, k):
-        return self.kw.get(k)
-
-
-_Widget.all = []
-
-
-class _Root(_Widget):
-    def title(self, *a):
-        pass
-
-    def resizable(self, *a):
-        pass
-
-    def protocol(self, *a):
-        pass
-
-    def after(self, ms, fn):
-        pass
-
-    def destroy(self):
-        pass
-
-
-def _fake_tk():
-    tk = types.SimpleNamespace(StringVar=_Var, IntVar=_Var, BooleanVar=_Var, Scale=_Widget)
-    ttk = types.SimpleNamespace(Frame=_Widget, LabelFrame=_Widget, Combobox=_Widget, Button=_Widget,
-                                Checkbutton=_Widget, Label=_Widget)
-    mb = types.SimpleNamespace(showerror=lambda *a: None)
-    return tk, ttk, mb
-
-
-def test_window_logic():
+# ----------------------------------------------------------------- controller (what the UI drives)
+def make_controller():
     reset_state()
-    ds.WEB_PORT_SAVE = ds.WEB_PORT
-    tk, ttk, mb = _fake_tk()
-    old_save = ds.save_settings
     ds.save_settings = lambda path=None: None
-    old_web = ds.start_web
-    ds.start_web = lambda port=None: None
+    c = ds.Controller()
+    c.refresh_devices()
+    ds.CTRL = c
+    return c
+
+
+def test_controller_flow():
+    c = make_controller()
     try:
-        app = ds.App(_Root(), tk, ttk, mb)
-        # VB-CABLE picked automatically, laptop mic picked for calibration
+        # VB-CABLE picked automatically, laptop mic picked for calibration, cable not offered as a mic
         assert ds.state["source"] == "Input: CABLE Output (VB-Audio Virtual Cable)"
         assert ds.state["mic"] == "Microphone Array (Realtek)"
-        assert "CABLE Output (VB-Audio Virtual Cable)" not in app.mics
-        # nothing picked -> friendly message
-        app.start()
+        assert "CABLE Output (VB-Audio Virtual Cable)" not in c.mics
+        assert not c.public_state()["needs_cable"]
+        c.command("start")
         assert ds.state["status"] == "Pick at least one speaker."
-        # loop guard: playing into CABLE Input while capturing CABLE Output
-        ds.state["outputs"][0]["device"] = "CABLE Input (VB-Audio Virtual Cable)"
-        app.start()
+        # loop guards
+        c.set(["outputs", 0, "device"], "CABLE Input (VB-Audio Virtual Cable)")
+        c.command("start")
         assert "echo forever" in ds.state["status"]
-        # loop guard: loopback of the same speaker
-        ds.state["source"] = "System audio of: Speakers (Realtek)"
-        ds.state["outputs"][0]["device"] = "Speakers (Realtek)"
-        app.start()
+        c.set(["source"], "System audio of: Speakers (Realtek)")
+        c.set(["outputs", 0, "device"], "Speakers (Realtek)")
+        c.command("start")
         assert "echo forever" in ds.state["status"]
-        # proper start with two real speakers
-        ds.state["source"] = "Input: CABLE Output (VB-Audio Virtual Cable)"
-        ds.state["outputs"][0]["device"] = "JBL Flip 5"
-        ds.state["outputs"][1]["device"] = "boAt Stone 350"
-        app.start()
-        time.sleep(0.5)
-        assert app.engine.running and len(app.engine.workers) == 2
-        # phone remote changes show up in the window on the next poll
-        ds.apply_set(["outputs", 1, "delay"], 230)
-        ds.apply_set(["master"], 40)
-        app.poll()
-        assert app.vars[1]["delay"].get() == 230 and app.master_var.get() == 40
-        assert "Playing to" in ds.state["status"]
-        # phone "stop"
-        ds.state["pending"] = "stop"
-        app.poll()
-        assert not app.engine.running and app.run_btn["text"] == "Start"
-        # calibrate needs playback running
-        app.calibrate()
-        assert "Press Start first" in ds.state["calib"]
+        # unknown device names are ignored
+        c.set(["outputs", 0, "device"], "Not a real speaker")
+        assert ds.state["outputs"][0]["device"] == "Speakers (Realtek)"
+        # proper start
+        c.set(["source"], "Input: CABLE Output (VB-Audio Virtual Cable)")
+        c.set(["outputs", 0, "device"], "JBL Flip 5")
+        c.set(["outputs", 1, "device"], "boAt Stone 350")
+        c.command("start")
+        time.sleep(0.6)
+        c.tick()
+        assert c.engine.running and len(c.engine.workers) == 2
+        assert ds.state["status"] == "Playing to JBL Flip 5 and boAt Stone 350"
+        st = c.public_state()
+        assert st["running"] and max(st["levels"]) > 0.05, st["levels"]   # meters move
+        # switching a speaker while playing restarts on the new device
+        c.set(["outputs", 1, "device"], "Speakers (Realtek)")
+        time.sleep(0.3)
+        assert c.engine.workers[1].speaker.name == "Speakers (Realtek)"
+        c.command("stop")
+        assert not c.engine.running and ds.state["status"] == "Stopped"
+        c.command("calibrate")
+        assert "Press Start" in ds.state["calib"]
     finally:
-        ds.save_settings = old_save
-        ds.start_web = old_web
-        try:
-            app.engine.stop()
-        except Exception:
-            pass
+        c.shutdown()
+
+
+def test_controller_no_cable_hint():
+    saved = DEVICES["mics"]
+    DEVICES["mics"] = [FakeDevice("Microphone Array (Realtek)")]
+    try:
+        c = make_controller()
+        assert c.public_state()["needs_cable"]
+        assert ds.state["source"] == ""
+    finally:
+        DEVICES["mics"] = saved
+
+
+def test_window_close_quits_but_reload_does_not():
+    c = make_controller()
+    c.BYE_GRACE_S = 0.3
+    c.command("bye", local=False)            # phones can't close the app
+    assert c.bye_at is None
+    c.command("quit", local=False)
+    assert not c.quit_evt.is_set()
+    c.command("bye", local=True)             # page reload: new poll arrives in time
+    c.saw_local_ui()
+    time.sleep(0.4)
+    c.tick()
+    assert not c.quit_evt.is_set()
+    c.command("bye", local=True)             # window really closed
+    time.sleep(0.4)
+    c.tick()
+    assert c.quit_evt.is_set()
+
+
+def test_ui_in_headless_browser():
+    """Load the real page in Chrome (if Playwright is available), click through it,
+    and save screenshots for a visual check."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return
+    c = make_controller()
+    srv = ds.start_web(port=0)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    shots = os.path.join(HERE, "screenshots")
+    os.makedirs(shots, exist_ok=True)
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.launch()
+            page = b.new_page(viewport={"width": 1000, "height": 900})
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(url)
+            page.wait_for_selector("#dev1")
+            page.select_option("#dev0", "JBL Flip 5")
+            page.select_option("#dev1", "boAt Stone 350")
+            page.click("#toggle")
+            page.wait_for_function("document.getElementById('toggle').textContent==='Stop'")
+            page.click("#mo1 button[data-v='Right channel only']")
+            page.click("#mo0 button[data-v='Left channel only']")
+            page.click("#mu1")
+            page.wait_for_timeout(900)
+            assert ds.state["outputs"][1]["mode"] == "Right channel only"
+            assert ds.state["outputs"][1]["muted"] is True
+            assert ds.state["outputs"][0]["device"] == "JBL Flip 5"
+            page.click("#mu1")
+            page.wait_for_timeout(700)
+            page.screenshot(path=os.path.join(shots, "desktop.png"), full_page=True)
+            m = b.new_page(viewport={"width": 390, "height": 844}, device_scale_factor=2)
+            m.goto(url.replace("127.0.0.1", "localhost"))
+            m.wait_for_selector("#dev1")
+            m.wait_for_timeout(700)
+            m.screenshot(path=os.path.join(shots, "phone.png"), full_page=True)
+            b.close()
+            assert not errors, errors
+    finally:
+        srv.shutdown()
+        c.shutdown()
 
 
 if __name__ == "__main__":

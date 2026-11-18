@@ -1,0 +1,55 @@
+name: Build DualSpeaker.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Tests (simulated devices)
+        run: python tests/test_dual_speaker.py
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --windowed --name DualSpeaker dual_speaker.py
+
+      - name: Smoke test (exe starts, serves the UI, quits cleanly)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\DualSpeaker.exe -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 30 -and -not $ok; $i++) {
+            Start-Sleep 1
+            try { $r = Invoke-WebRequest http://127.0.0.1:8765/state -UseBasicParsing; $ok = $true } catch {}
+          }
+          if (-not $ok) { throw "exe did not start its UI server" }
+          Write-Host $r.Content
+          Invoke-WebRequest http://127.0.0.1:8765/cmd -Method POST -Body '{"cmd":"quit"}' -ContentType 'application/json' -UseBasicParsing | Out-Null
+          if (-not $p.WaitForExit(10000)) { Stop-Process $p -Force; throw "exe did not quit" }
+          Write-Host "exe started and quit OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DualSpeaker
+          path: dist/DualSpeaker.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DualSpeaker.exe

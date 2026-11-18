@@ -4,6 +4,11 @@ Play your PC's audio on **two speakers at once, even from different brands** (Bl
 
 It works like Samsung's **Dual Audio**, but on a Windows PC, and adds the thing Dual Audio users keep asking for: **a delay control for each speaker, plus automatic calibration**.
 
+![Desktop window](docs/ui-desktop.png)
+
+## Download
+Get **`DualSpeaker.exe`** from the [Releases page](../../releases/latest). It's a single file, with no Python or installer needed. Windows may warn you the first time because the app isn't signed: click **More info → Run anyway**.
+
 ## Features
 - **Two speakers at once:** your PC's audio plays on both.
 - **Controls for each speaker:** on/off, mute, volume (0–150%), channel (Stereo, Left only, Right only, Mono, Swap L/R) and delay (0–1000 ms).
@@ -11,22 +16,24 @@ It works like Samsung's **Dual Audio**, but on a Windows PC, and adds the thing 
 - **Auto-calibrate:** each speaker plays short chirps, your laptop mic listens, and the app sets the delay so both arrive together.
 - **Drift correction:** two speakers keep slightly different time, so the app makes tiny speed adjustments (at most 0.2%, inaudible). They stay in sync for hours with no clicks.
 - **Reconnects by itself** if a Bluetooth speaker drops out or is switched off.
-- **Phone remote:** open `http://<PC address>:8765` on your phone over the same Wi-Fi. No app install needed.
+- **Simple UI:** the app opens as its own window on the PC, and the same page works on your phone over Wi-Fi at `http://<PC address>:8765`. No app install needed.
+- **Live level meters** for each speaker, so you can see that sound is flowing.
 - **Settings are saved** to `dual_speaker_settings.json` next to the app.
 - **Light on the PC:** under 1% of one CPU core.
 
 ## One-time setup
-1. Install **Python 3** from python.org and tick **"Add python.exe to PATH"** during install.
-2. Install **VB-CABLE**, a free virtual audio cable, from vb-audio.com/Cable. Restart the PC afterwards.
-3. Pair and connect both speakers in Windows. Check that each one plays sound on its own.
-4. In Windows Sound settings, set **Output** to **CABLE Input (VB-Audio Virtual Cable)**. All PC audio now flows into the cable, and the app sends it on to your speakers.
+1. Install **VB-CABLE**, a free virtual audio cable, from vb-audio.com/Cable. Restart the PC afterwards.
+2. Pair and connect both speakers in Windows. Check that each one plays sound on its own.
+3. In Windows Sound settings, set **Output** to **CABLE Input (VB-Audio Virtual Cable)**. All PC audio now flows into the cable, and the app sends it on to your speakers.
 
 ## Every time
-1. Double-click **`Start Dual Speaker.bat`**. The first run installs `soundcard` and `numpy`.
-2. **What to play:** choose `Input: CABLE Output (VB-Audio Virtual Cable)`. It's usually picked for you.
-3. Choose **Speaker 1** and **Speaker 2**, then press **Start**.
-4. Press **Auto-calibrate delay**. You'll hear chirps for about 10 seconds. For best results, keep the laptop between the speakers and the room quiet.
-5. To check by ear instead, turn on **Sync test**. The music mutes and both speakers beep. Adjust **Delay** until the two beeps sound like one.
+1. Open **`DualSpeaker.exe`**. Its window opens; opening it again just brings the window back.
+2. Choose a speaker on each card, then press **Start**. The source (`CABLE Output`) is picked for you; change it under **Setup** if you need to.
+3. Press **Auto-calibrate delay**. You'll hear chirps for about 10 seconds. For best results, keep the laptop between the speakers and the room quiet.
+4. To check by ear instead, turn on **Sync test** under **Setup**. The music mutes and both speakers beep. Adjust **Delay** until the two beeps sound like one.
+5. Closing the window stops the audio and quits the app.
+
+**Running from source instead of the exe:** install Python 3 (tick "Add to PATH"), then double-click `Start Dual Speaker.bat`.
 
 ## Tips
 - In the speaker list, pick a speaker's **Stereo / Headphones** entry, never its **Hands-Free** one, which is mono and low quality. Use the laptop's own mic for calibration, not a Bluetooth one. Opening a Bluetooth mic switches that speaker into Hands-Free mode.
@@ -36,6 +43,11 @@ It works like Samsung's **Dual Audio**, but on a Windows PC, and adds the thing 
 
 ## Does Windows do this already?
 Windows 11 has **Shared audio**, but only for **Bluetooth LE Audio** accessories on supported PCs (Copilot+ PCs first). Most Bluetooth speakers today are "Classic" Bluetooth, so this app fills that gap. Speakers that support **Auracast** can also sync with each other directly, if both support it.
+
+## Phone remote
+<img src="docs/ui-phone.png" width="300" alt="Phone remote">
+
+The window shows the address under **Setup**. Windows Firewall may ask about it the first time: allow it on **private** networks.
 
 ## Tests
 ```
@@ -47,7 +59,7 @@ The tests run without real hardware. They simulate:
 - a source that stalls
 - a speaker that disconnects and reconnects
 
-They also check the phone remote (over HTTP and a JS syntax check) and the window logic (with a stand-in for tkinter).
+They also check the UI server over HTTP, closing versus reloading the window, and the page itself in a headless browser (clicks and screenshots, when Playwright is installed). Every push builds the exe on a Windows machine on GitHub and starts it, to check the UI responds and Quit works.
 
 ## How it works
 ```

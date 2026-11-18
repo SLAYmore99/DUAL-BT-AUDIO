@@ -10,19 +10,22 @@ volume, mute, on/off, channel (stereo / left / right / mono / swap) and delay.
   different clocks stay in sync without clicks.
 * Auto-calibrate: each speaker plays short chirps in its own frequency band,
   the laptop mic hears both, and the delay of the faster speaker is set for you.
-* Phone remote on your Wi-Fi (address shown in the window).
+* Simple UI: opens as its own window on the PC (Edge app mode, built into Windows)
+  and the same page works as a phone remote on your Wi-Fi.
 
-Windows 10/11. Needs Python 3.9+ and:  pip install soundcard numpy
+Windows 10/11. Run DualSpeaker.exe, or with Python 3.9+:  pip install soundcard numpy
 Ideas credited in README.md (erdongshuiyang/DualSpeaker, MIT).
 """
 import ctypes
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
 import warnings
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -31,7 +34,6 @@ try:
     import soundcard as sc
 except ImportError:
     print("Missing package. Run:  python -m pip install soundcard numpy")
-    input("Press Enter to close...")
     sys.exit(1)
 
 warnings.filterwarnings("ignore", category=getattr(sc, "SoundcardRuntimeWarning", RuntimeWarning))
@@ -50,7 +52,8 @@ REANCHOR_S = 0.25     # error bigger than this (e.g. after a stall): jump instea
 RETRY_S = 2.0         # reconnect delay when a device drops (e.g. Bluetooth speaker turned off)
 WEB_PORT = 8765
 N_OUT = 2
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Settings live next to the .exe (or the script), not in PyInstaller's temp folder.
+HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 SETTINGS = os.path.join(HERE, "dual_speaker_settings.json")
 MODES = ["Stereo", "Left channel only", "Right channel only", "Mono (L+R)", "Swap L/R"]
 
@@ -270,6 +273,7 @@ class OutputWorker(threading.Thread):
         self.missing = 0
         self.resyncs = 0
         self.played = 0
+        self.level = 0.0
 
     def run(self):
         com_init()
@@ -302,6 +306,7 @@ class OutputWorker(threading.Thread):
         ring = self.engine.ring
         if self.prefill > 0:
             self.prefill -= BLOCK
+            self.level = 0.0
             return np.zeros((BLOCK, 2), np.float32)
         with state_lock:
             o = dict(state["outputs"][self.idx])
@@ -320,6 +325,7 @@ class OutputWorker(threading.Thread):
             self.starving = True
             self.missing += BLOCK
             self.played += BLOCK
+            self.level = 0.0
             return np.zeros((BLOCK, 2), np.float32)
         if self.starving or abs(err) > REANCHOR_S * SR:  # back after a stall, or far off: jump once
             self.starving = False
@@ -345,7 +351,9 @@ class OutputWorker(threading.Thread):
             gain = 0.0 if (o["muted"] or not o["enabled"]) else (o["volume"] / 100) * (master / 100)
         self.position += BLOCK * step
         self.played += BLOCK
-        return np.clip(out * gain, -1.0, 1.0).astype(np.float32)
+        out = np.clip(out * gain, -1.0, 1.0).astype(np.float32)
+        self.level = float(np.abs(out).max())
+        return out
 
 
 class Engine:
@@ -461,68 +469,139 @@ class Engine:
         return errs
 
 
-# ----------------------------------------------------------------- phone remote
-WEB_PAGE = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Room Speakers</title><style>
-body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:520px}
-h1{font-size:20px;margin:0 0 12px}.card{background:#1d1d1d;border-radius:14px;padding:14px;margin-bottom:12px}
-.row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0}
-input[type=range]{flex:1}button{background:#2d6cdf;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-size:15px}
-button.off{background:#444}select{background:#2a2a2a;color:#eee;border:0;border-radius:8px;padding:6px}
-.name{font-weight:600}.muted{opacity:.6;font-size:13px}.val{width:60px;text-align:right}
-</style></head><body><h1>Room Speakers</h1>
-<div class="card"><div class="row"><button id="toggle">Start</button><span id="status" class="muted"></span></div>
-<div class="row">Master<input id="master" type="range" min="0" max="100"><span class="val" id="masterv"></span></div>
-<div class="row"><button id="sync" class="off">Sync test: off</button><button id="cal">Auto-calibrate</button></div>
-<div class="muted" id="calmsg"></div></div>
-<div id="outs"></div>
+# ----------------------------------------------------------------- user interface (desktop window + phone)
+UI_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Dual Speaker</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--card2:#20242d;--line:#2a2f3a;--text:#e9ecf2;--dim:#8b93a3;--acc:#4f8cff;--ok:#33c27f;--warn:#f0b03d;--bad:#ef5a5a}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:18px 18px 28px}
+header{display:flex;align-items:center;gap:14px;margin-bottom:6px}
+.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#4f8cff,#7a5cff);display:grid;place-items:center;font-weight:700}
+h1{font-size:19px;margin:0;font-weight:650;letter-spacing:.2px}
+.grow{flex:1}
+.status{color:var(--dim);font-size:13px;margin:0 0 16px 48px;min-height:18px}
+.status.bad{color:var(--bad)}
+button{font:inherit;color:var(--text);background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:8px 14px;cursor:pointer;transition:background .15s,transform .1s}
+button:hover{background:#262b36}button:active{transform:scale(.97)}
+button.primary{background:var(--acc);border-color:var(--acc);font-weight:600;padding:10px 22px;border-radius:999px}
+button.primary.stop{background:#2b3140;border-color:#3a4252}
+button.on{background:rgba(79,140,255,.18);border-color:var(--acc);color:#cfe0ff}
+button.mute.on{background:rgba(239,90,90,.16);border-color:var(--bad);color:#ffd2d2}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:680px){.grid{grid-template-columns:1fr}.status{margin-left:0}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+.card.off{opacity:.55}
+.row{display:flex;align-items:center;gap:12px;margin:12px 0}
+.row label{width:66px;color:var(--dim);font-size:13px}
+.val{width:58px;text-align:right;font-variant-numeric:tabular-nums;color:var(--dim);font-size:13px}
+.title{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.title b{font-size:15px}
+select{font:inherit;width:100%;background:var(--card2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:6px;border-radius:6px;background:var(--line);outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:#fff;border:3px solid var(--acc);cursor:pointer}
+input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#fff;border:3px solid var(--acc)}
+.meter{height:6px;border-radius:6px;background:var(--card2);overflow:hidden;margin:10px 0 2px}
+.meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ok),var(--warn) 80%,var(--bad));transition:width .12s linear}
+.seg{display:flex;background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:3px;flex:1}
+.seg button{flex:1;border:0;background:none;padding:6px 4px;font-size:13px;border-radius:8px;color:var(--dim)}
+.seg button.sel{background:#2f3646;color:var(--text)}
+.bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.msg{color:var(--dim);font-size:13px;margin-top:8px;min-height:18px}
+details{margin-top:14px}summary{cursor:pointer;color:var(--dim);font-size:13px;user-select:none}
+.hint{background:rgba(240,176,61,.1);border:1px solid rgba(240,176,61,.35);border-radius:12px;padding:12px 14px;font-size:13px;margin-bottom:14px}
+.hint ol{margin:6px 0 0 18px;padding:0}
+.small{font-size:12px;color:var(--dim)}
+.sw{position:relative;width:42px;height:24px;border-radius:24px;background:var(--line);border:0;padding:0;flex:none}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s}
+.sw.on{background:var(--acc)}.sw.on::after{left:21px}
+</style></head><body><div class="wrap">
+<header><div class="logo">2</div><h1>Dual Speaker</h1><div class="grow"></div>
+<button id="quit" class="small" style="display:none" title="Stop audio and close the app">Quit</button>
+<button id="toggle" class="primary">Start</button></header>
+<div id="status" class="status"></div>
+<div id="hint" class="hint" style="display:none"><b>One-time setup:</b> install VB-CABLE (free, vb-audio.com/Cable), restart the PC, then
+<ol><li>Windows Sound settings &rarr; Output &rarr; <b>CABLE Input</b></li><li>Press <b>Refresh devices</b> below</li></ol></div>
+<div class="grid" id="outs"></div>
+<div class="card" style="margin-top:14px">
+<div class="row"><label>Master</label><input id="master" type="range" min="0" max="100"><span class="val" id="masterv"></span></div>
+<div class="bar"><button id="cal">Auto-calibrate delay</button><span class="small">Plays chirps for ~10 s, the laptop mic lines both speakers up.</span></div>
+<div class="msg" id="calmsg"></div>
+<details id="setup"><summary>Setup</summary>
+<div class="row"><label>Play</label><select id="source"></select></div>
+<div class="row"><label>Mic</label><select id="mic"></select></div>
+<div class="bar"><button id="refresh">Refresh devices</button>
+<span class="bar"><button id="sync" class="sw" aria-label="Sync test"></button><span class="small">Sync test (beeps, music muted)</span></span></div>
+<p class="small" id="remote"></p>
+</details></div>
+</div>
 <script>
-const MODES=["Stereo","Left channel only","Right channel only","Mono (L+R)","Swap L/R"];
-let S=null,busy=false;
-function post(u,b){return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})}
-function set(path,value){post("/set",{path,value})}
+const MODES=[["Stereo","Stereo"],["Left channel only","Left"],["Right channel only","Right"],["Mono (L+R)","Mono"],["Swap L/R","Swap"]];
+let S=null,busy=0,lev=[0,0];
+const $=id=>document.getElementById(id);
+function post(u,b){return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(poll)}
+function set(path,value){return post("/set",{path,value})}
+function cmd(c){return post("/cmd",{cmd:c})}
+function paint(el){const p=(el.value-el.min)/(el.max-el.min)*100;el.style.background=`linear-gradient(90deg,var(--acc) ${p}%,var(--line) ${p}%)`}
+document.addEventListener("input",e=>{if(e.target.type==="range")paint(e.target)});
+function hold(el){el.addEventListener("pointerdown",()=>busy++);el.addEventListener("pointerup",()=>setTimeout(()=>busy=Math.max(0,busy-1),300));}
+function fill(sel,items,value,blank){const want=JSON.stringify([items,value]);if(sel.dataset.k===want||document.activeElement===sel)return;sel.dataset.k=want;
+ sel.innerHTML=(blank?`<option value="">${blank}</option>`:"")+items.map(n=>`<option>${n.replace(/</g,"&lt;")}</option>`).join("");sel.value=value||"";}
 function build(){
- const box=document.getElementById("outs");box.innerHTML="";
- S.outputs.forEach((o,i)=>{const d=document.createElement("div");d.className="card";d.innerHTML=`
- <div class="row"><span class="name">Speaker ${i+1}</span><span class="muted" id="dev${i}"></span></div>
- <div class="row"><button id="en${i}">On</button><button id="mu${i}">Mute</button></div>
- <div class="row">Volume<input id="vol${i}" type="range" min="0" max="150"><span class="val" id="volv${i}"></span></div>
- <div class="row">Delay<input id="del${i}" type="range" min="0" max="1000"><span class="val" id="delv${i}"></span></div>
- <div class="row">Channel<select id="mo${i}">${MODES.map(m=>`<option>${m}</option>`).join("")}</select></div>`;
- box.appendChild(d);
- const vol=d.querySelector("#vol"+i),del=d.querySelector("#del"+i);
- vol.oninput=()=>{d.querySelector("#volv"+i).textContent=vol.value+"%";set(["outputs",i,"volume"],+vol.value)};
- del.oninput=()=>{d.querySelector("#delv"+i).textContent=del.value+"ms";set(["outputs",i,"delay"],+del.value)};
- d.querySelector("#mo"+i).onchange=e=>set(["outputs",i,"mode"],e.target.value);
- d.querySelector("#en"+i).onclick=()=>set(["outputs",i,"enabled"],!S.outputs[i].enabled);
- d.querySelector("#mu"+i).onclick=()=>set(["outputs",i,"muted"],!S.outputs[i].muted);
- [vol,del].forEach(el=>{el.onpointerdown=()=>busy=true;el.onpointerup=()=>busy=false});});}
+ const box=$("outs");box.innerHTML="";
+ S.outputs.forEach((o,i)=>{const c=document.createElement("div");c.className="card";c.id="card"+i;c.innerHTML=`
+ <div class="title"><b>Speaker ${i+1}</b><span class="grow"></span><button class="mute" id="mu${i}">Mute</button><button class="sw" id="en${i}" aria-label="On"></button></div>
+ <select id="dev${i}"></select>
+ <div class="meter"><i id="lv${i}"></i></div>
+ <div class="row"><label>Volume</label><input id="vol${i}" type="range" min="0" max="150"><span class="val" id="volv${i}"></span></div>
+ <div class="row"><label>Delay</label><input id="del${i}" type="range" min="0" max="1000" step="5"><span class="val" id="delv${i}"></span></div>
+ <div class="row"><label>Channel</label><div class="seg" id="mo${i}">${MODES.map(([v,t])=>`<button data-v="${v}">${t}</button>`).join("")}</div></div>`;
+ box.appendChild(c);
+ const vol=$("vol"+i),del=$("del"+i);hold(vol);hold(del);
+ vol.oninput=()=>{$("volv"+i).textContent=vol.value+"%";set(["outputs",i,"volume"],+vol.value)};
+ del.oninput=()=>{$("delv"+i).textContent=del.value+" ms";set(["outputs",i,"delay"],+del.value)};
+ $("dev"+i).onchange=e=>set(["outputs",i,"device"],e.target.value);
+ $("en"+i).onclick=()=>set(["outputs",i,"enabled"],!S.outputs[i].enabled);
+ $("mu"+i).onclick=()=>set(["outputs",i,"muted"],!S.outputs[i].muted);
+ $("mo"+i).querySelectorAll("button").forEach(b=>b.onclick=()=>set(["outputs",i,"mode"],b.dataset.v));});}
 function render(){
- const t=document.getElementById("toggle");t.textContent=S.running?"Stop":"Start";t.className=S.running?"":"off";
- document.getElementById("status").textContent=S.status;
- document.getElementById("calmsg").textContent=S.calib;
- const sy=document.getElementById("sync");sy.textContent="Sync test: "+(S.sync_test?"on":"off");sy.className=S.sync_test?"":"off";
- if(!busy){document.getElementById("master").value=S.master}
- document.getElementById("masterv").textContent=S.master+"%";
+ const t=$("toggle");t.textContent=S.running?"Stop":"Start";t.classList.toggle("stop",S.running);
+ const st=$("status");st.textContent=S.status;st.classList.toggle("bad",/^Problem|echo|Pick/.test(S.status));
+ $("quit").style.display=S.local?"":"none";
+ $("hint").style.display=S.needs_cable?"":"none";
+ $("calmsg").textContent=S.calib;$("cal").disabled=S.calibrating;$("cal").textContent=S.calibrating?"Calibrating…":"Auto-calibrate delay";
+ $("sync").classList.toggle("on",S.sync_test);
+ if(!busy)$("master").value=S.master;paint($("master"));$("masterv").textContent=S.master+"%";
+ fill($("source"),S.devices.sources,S.source,"Choose what to play…");fill($("mic"),S.devices.mics,S.mic,"Choose a mic…");
+ $("remote").textContent=S.remote?("Phone remote (same Wi-Fi): "+S.remote):"";
  S.outputs.forEach((o,i)=>{
-  document.getElementById("dev"+i).textContent=o.device||"(no speaker picked)";
-  const en=document.getElementById("en"+i);en.textContent=o.enabled?"On":"Off";en.className=o.enabled?"":"off";
-  const mu=document.getElementById("mu"+i);mu.textContent=o.muted?"Muted":"Mute";mu.className=o.muted?"":"off";
-  if(!busy){document.getElementById("vol"+i).value=o.volume;document.getElementById("del"+i).value=o.delay}
-  document.getElementById("volv"+i).textContent=o.volume+"%";document.getElementById("delv"+i).textContent=o.delay+"ms";
-  const mo=document.getElementById("mo"+i);if(document.activeElement!==mo)mo.value=o.mode;});}
-async function poll(){try{const r=await fetch("/state");const n=await r.json();const first=!S;S=n;if(first)build();render()}catch(e){}}
-const m=document.getElementById("master");m.oninput=()=>{document.getElementById("masterv").textContent=m.value+"%";set(["master"],+m.value)};
-m.onpointerdown=()=>busy=true;m.onpointerup=()=>busy=false;
-document.getElementById("toggle").onclick=()=>post("/cmd",{cmd:S&&S.running?"stop":"start"});
-document.getElementById("sync").onclick=()=>set(["sync_test"],!S.sync_test);
-document.getElementById("cal").onclick=()=>post("/cmd",{cmd:"calibrate"});
-poll();setInterval(poll,700);
+  fill($("dev"+i),S.devices.speakers,o.device,"Choose a speaker…");
+  $("card"+i).classList.toggle("off",!o.enabled);
+  $("en"+i).classList.toggle("on",o.enabled);
+  const mu=$("mu"+i);mu.classList.toggle("on",o.muted);mu.textContent=o.muted?"Muted":"Mute";
+  if(!busy){$("vol"+i).value=o.volume;$("del"+i).value=o.delay}
+  paint($("vol"+i));paint($("del"+i));
+  $("volv"+i).textContent=o.volume+"%";$("delv"+i).textContent=o.delay+" ms";
+  $("mo"+i).querySelectorAll("button").forEach(b=>b.classList.toggle("sel",b.dataset.v===o.mode));
+  lev[i]=Math.max((S.levels[i]||0),lev[i]*0.6);$("lv"+i).style.width=Math.min(100,Math.sqrt(lev[i])*100)+"%";});}
+async function poll(){try{const r=await fetch("/state",{cache:"no-store"});const n=await r.json();const first=!S;S=n;if(first)build();render()}catch(e){$("status").textContent="Can't reach the app. Is it still running on the PC?"}}
+const m=$("master");hold(m);m.oninput=()=>{$("masterv").textContent=m.value+"%";set(["master"],+m.value)};
+$("toggle").onclick=()=>cmd(S&&S.running?"stop":"start");
+$("cal").onclick=()=>cmd("calibrate");
+$("refresh").onclick=()=>cmd("refresh");
+$("quit").onclick=()=>{cmd("quit");document.body.innerHTML='<div class="wrap"><h1>Dual Speaker closed</h1><p class="small">You can close this window.</p></div>'};
+$("sync").onclick=()=>set(["sync_test"],!S.sync_test);
+$("source").onchange=e=>set(["source"],e.target.value);
+$("mic").onchange=e=>set(["mic"],e.target.value);
+addEventListener("pagehide",()=>navigator.sendBeacon("/cmd",JSON.stringify({cmd:"bye"})));
+poll();setInterval(poll,500);
 </script></body></html>"""
 
 
 def apply_set(path, value):
-    """Validate and apply a change coming from the phone remote."""
+    """Validate and apply a numeric/flag change (from the UI or phone)."""
     try:
         with state_lock:
             if path == ["master"]:
@@ -544,9 +623,199 @@ def apply_set(path, value):
         pass
 
 
+class Controller:
+    """Everything the UI can do: devices, start/stop, calibrate, settings, quitting."""
+
+    BYE_GRACE_S = 4.0   # window closed (not just reloaded) -> quit after this
+
+    def __init__(self):
+        self.engine = Engine()
+        self.sources, self.speakers, self.mics = {}, {}, {}
+        self.dirty = False
+        self.quit_evt = threading.Event()
+        self.bye_at = None
+        self.remote = ""
+        self.cal_thread = None
+
+    # --- devices
+    def refresh_devices(self):
+        sources, mics, speakers = {}, {}, {}
+        try:
+            for m in sc.all_microphones(include_loopback=True):
+                if getattr(m, "isloopback", False):
+                    sources["System audio of: " + m.name] = m
+                else:
+                    sources["Input: " + m.name] = m
+                    if "CABLE" not in m.name:
+                        mics[m.name] = m
+            speakers = {s.name: s for s in sc.all_speakers()}
+        except Exception as e:
+            self._status(f"Problem: couldn't list audio devices ({e})")
+        self.sources, self.mics, self.speakers = sources, mics, speakers
+        with state_lock:
+            if not state["source"] or state["source"] not in sources:
+                cable = [k for k in sources if "CABLE Output" in k]
+                if cable:
+                    state["source"] = cable[0]
+            if not state["mic"] or state["mic"] not in mics:
+                try:
+                    name = sc.default_microphone().name
+                except Exception:
+                    name = ""
+                state["mic"] = name if name in mics else (next(iter(mics)) if mics else "")
+        self.dirty = True
+
+    def public_state(self, local=False):
+        with state_lock:
+            pub = {k: state[k] for k in ("master", "running", "status", "sync_test", "calib", "source", "mic")}
+            pub["outputs"] = [dict(o) for o in state["outputs"]]
+        levels = [0.0] * N_OUT
+        for w in self.engine.workers:
+            levels[w.idx] = round(float(getattr(w, "level", 0.0)), 3)
+        pub.update(levels=levels, local=local, remote=self.remote, calibrating=self.engine.calibrating,
+                   needs_cable=not any("CABLE Output" in k for k in self.sources),
+                   devices={"sources": list(self.sources), "speakers": list(self.speakers), "mics": list(self.mics)})
+        return pub
+
+    # --- changes from the UI
+    def set(self, path, value):
+        restart = False
+        if path in (["source"], ["mic"]) and isinstance(value, str):
+            pool = self.sources if path == ["source"] else self.mics
+            if value in pool or value == "":
+                with state_lock:
+                    state[path[0]] = value
+                restart = path == ["source"]
+        elif len(path) == 3 and path[0] == "outputs" and path[2] == "device":
+            try:
+                i = int(path[1])
+            except (TypeError, ValueError):
+                return
+            if i in range(N_OUT) and isinstance(value, str) and (value in self.speakers or value == ""):
+                with state_lock:
+                    state["outputs"][i]["device"] = value
+                restart = True
+        else:
+            apply_set(path, value)
+        self.dirty = True
+        if restart and self.engine.running:
+            self.start()
+
+    def command(self, cmd, local=False):
+        if cmd == "start" and not self.engine.running:
+            self.start()
+        elif cmd == "stop" and self.engine.running:
+            self.stop()
+        elif cmd == "calibrate":
+            self.calibrate()
+        elif cmd == "refresh":
+            self.refresh_devices()
+        elif cmd == "quit" and local:
+            self.quit_evt.set()
+        elif cmd == "bye" and local:
+            self.bye_at = time.time() + self.BYE_GRACE_S
+
+    def saw_local_ui(self):
+        self.bye_at = None
+
+    # --- engine
+    def start(self):
+        with state_lock:
+            src = state["source"]
+            outs = [dict(o) for o in state["outputs"]]
+        mic = self.sources.get(src)
+        if mic is None:
+            return self._status("Pick what to play first (Setup, below).")
+        targets, used = [], set()
+        for i, o in enumerate(outs):
+            spk = self.speakers.get(o["device"])
+            if spk is None or o["device"] in used:
+                continue
+            if (getattr(mic, "isloopback", False) and mic.name == spk.name) or (
+                    "CABLE Input" in spk.name and "CABLE Output" in mic.name):
+                return self._status(f"Speaker {i + 1} is the device you're playing from - that would echo forever. "
+                                    "Pick your real speaker instead.")
+            used.add(o["device"])
+            targets.append((i, spk))
+        if not targets:
+            return self._status("Pick at least one speaker.")
+        self.engine.start(mic, targets)
+        with state_lock:
+            state["running"] = True
+        self.tick()
+
+    def stop(self):
+        self.engine.stop()
+        with state_lock:
+            state["running"] = False
+        self._status("Stopped")
+
+    def calibrate(self):
+        with state_lock:
+            mic = self.mics.get(state["mic"])
+        if self.engine.calibrating:
+            return
+        if mic is None:
+            return self._calib("Pick a calibration mic in Setup (the laptop's own mic, not a Bluetooth one).")
+        if not self.engine.running or len(self.engine.workers) < 2:
+            return self._calib("Press Start with both speakers picked first.")
+        self._calib("Calibrating... you'll hear chirps for about 10 seconds. Keep the room quiet.")
+
+        def job():
+            res = self.engine.calibrate(mic)
+            self._calib(res["msg"])
+            self.dirty = True
+        self.cal_thread = threading.Thread(target=job, daemon=True)
+        self.cal_thread.start()
+
+    def _calib(self, text):
+        with state_lock:
+            state["calib"] = text
+
+    def _status(self, text):
+        with state_lock:
+            state["status"] = text
+
+    # --- background loop
+    def tick(self):
+        errs = self.engine.errors()
+        with state_lock:
+            if state["running"] and not self.engine.running:
+                state["running"] = False
+            running = state["running"]
+            outs = [dict(o) for o in state["outputs"]]
+            status = state["status"]
+        if errs:
+            self._status("Problem: " + " | ".join(errs))
+        elif running:
+            names = [outs[w.idx]["device"] for w in self.engine.workers]
+            self._status("Playing to " + " and ".join(names))
+        elif status.startswith(("Playing", "Problem")):
+            self._status("Stopped")
+        if self.dirty:
+            self.dirty = False
+            save_settings()
+        if self.bye_at is not None and time.time() > self.bye_at:
+            self.quit_evt.set()
+
+    def run_loop(self):
+        while not self.quit_evt.wait(0.25):
+            self.tick()
+
+    def shutdown(self):
+        self.engine.stop()
+        save_settings()
+
+
+CTRL = None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def _local(self):
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
     def _send(self, code, body, ctype="application/json"):
         b = body.encode("utf-8")
@@ -559,12 +828,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            self._send(200, WEB_PAGE, "text/html; charset=utf-8")
+            self._send(200, UI_PAGE, "text/html; charset=utf-8")
         elif self.path == "/state":
-            with state_lock:
-                pub = {k: state[k] for k in ("master", "running", "status", "sync_test", "calib")}
-                pub["outputs"] = [dict(o) for o in state["outputs"]]
-            self._send(200, json.dumps(pub))
+            local = self._local()
+            if local:
+                CTRL.saw_local_ui()
+            self._send(200, json.dumps(CTRL.public_state(local)))
         else:
             self._send(404, "{}")
 
@@ -575,10 +844,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, "{}")
         if self.path == "/set" and isinstance(data.get("path"), list):
-            apply_set(data["path"], data.get("value"))
-        elif self.path == "/cmd" and data.get("cmd") in ("start", "stop", "calibrate"):
-            with state_lock:
-                state["pending"] = data["cmd"]
+            CTRL.set(data["path"], data.get("value"))
+        elif self.path == "/cmd" and isinstance(data.get("cmd"), str):
+            CTRL.command(data["cmd"], local=self._local())
         self._send(200, "{}")
 
 
@@ -599,273 +867,57 @@ def start_web(port=WEB_PORT):
     return srv
 
 
-# ----------------------------------------------------------------- desktop window
-class App:
-    def __init__(self, root, tk, ttk, messagebox):
-        self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
-        self.root = root
-        self.engine = Engine()
-        self.sources, self.speakers, self.mics = {}, {}, {}
-        self.vars = []
-        self.dirty = False
-        root.title("Dual Speaker Mixer")
-        root.resizable(False, False)
+def open_window(url):
+    """Open the UI as its own app window (Microsoft Edge app mode, built into Windows);
+    fall back to the default browser."""
+    if sys.platform == "win32":
+        profile = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "DualSpeaker", "window")
+        for base in (os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramFiles", "")):
+            edge = os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")
+            if base and os.path.exists(edge):
+                try:
+                    subprocess.Popen([edge, f"--app={url}", "--window-size=1000,900", f"--user-data-dir={profile}",
+                                      "--no-first-run", "--no-default-browser-check"])
+                    return
+                except OSError:
+                    pass
+    webbrowser.open(url)
 
-        top = ttk.Frame(root, padding=12)
-        top.grid(sticky="nsew")
 
-        src = ttk.LabelFrame(top, text="What to play", padding=10)
-        src.grid(row=0, column=0, columnspan=N_OUT, sticky="ew")
-        self.src_var = tk.StringVar(value=state["source"])
-        self.src_box = ttk.Combobox(src, textvariable=self.src_var, width=62, state="readonly")
-        self.src_box.grid(row=0, column=0, columnspan=3, sticky="ew")
-        self.src_box.bind("<<ComboboxSelected>>", lambda e: self._set_top("source", self.src_var.get(), restart=True))
-        ttk.Button(src, text="Refresh devices", command=self.refresh_devices).grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.run_btn = ttk.Button(src, text="Start", command=self.toggle)
-        self.run_btn.grid(row=1, column=1, pady=(8, 0))
-        self.sync_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(src, text="Sync test (beeps)", variable=self.sync_var,
-                        command=lambda: self._set_top("sync_test", self.sync_var.get())).grid(row=1, column=2, sticky="e", pady=(8, 0))
-
-        ttk.Label(src, text="Master volume").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        self.master_var = tk.IntVar(value=state["master"])
-        tk.Scale(src, from_=0, to=100, orient="horizontal", length=330, variable=self.master_var,
-                 command=lambda v: self._set_top("master", int(float(v)))).grid(row=2, column=1, columnspan=2, sticky="ew")
-
-        ttk.Label(src, text="Calibration mic").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        self.mic_var = tk.StringVar(value=state["mic"])
-        self.mic_box = ttk.Combobox(src, textvariable=self.mic_var, width=36, state="readonly")
-        self.mic_box.grid(row=3, column=1, sticky="w", pady=(10, 0))
-        self.mic_box.bind("<<ComboboxSelected>>", lambda e: self._set_top("mic", self.mic_var.get()))
-        self.cal_btn = ttk.Button(src, text="Auto-calibrate delay", command=self.calibrate)
-        self.cal_btn.grid(row=3, column=2, sticky="e", pady=(10, 0))
-        self.cal_label = ttk.Label(src, text="", foreground="#555", wraplength=600)
-        self.cal_label.grid(row=4, column=0, columnspan=3, sticky="w")
-
-        for i in range(N_OUT):
-            self._build_output(top, i)
-
-        self.status = ttk.Label(top, text="", foreground="#555", wraplength=640, justify="left")
-        self.status.grid(row=2, column=0, columnspan=N_OUT, sticky="w", pady=(10, 0))
-        self.web_label = ttk.Label(top, text="", foreground="#2d6cdf")
-        self.web_label.grid(row=3, column=0, columnspan=N_OUT, sticky="w")
-
-        self.refresh_devices()
-        self._start_web()
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(250, self.poll)
-
-    def _build_output(self, parent, i):
-        tk, ttk = self.tk, self.ttk
-        o = state["outputs"][i]
-        f = ttk.LabelFrame(parent, text=f"Speaker {i + 1}", padding=10)
-        f.grid(row=1, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0), pady=(10, 0))
-        v = {
-            "device": tk.StringVar(value=o["device"]),
-            "enabled": tk.BooleanVar(value=o["enabled"]),
-            "volume": tk.IntVar(value=o["volume"]),
-            "mode": tk.StringVar(value=o["mode"]),
-            "delay": tk.IntVar(value=o["delay"]),
-            "muted": tk.BooleanVar(value=o["muted"]),
-        }
-        self.vars.append(v)
-        box = ttk.Combobox(f, textvariable=v["device"], width=30, state="readonly")
-        box.grid(row=0, column=0, columnspan=2, sticky="ew")
-        box.bind("<<ComboboxSelected>>", lambda e: self._set_out(i, "device", v["device"].get(), restart=True))
-        v["box"] = box
-        ttk.Checkbutton(f, text="On", variable=v["enabled"],
-                        command=lambda: self._set_out(i, "enabled", v["enabled"].get())).grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Checkbutton(f, text="Mute", variable=v["muted"],
-                        command=lambda: self._set_out(i, "muted", v["muted"].get())).grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Label(f, text="Volume %").grid(row=2, column=0, sticky="w")
-        tk.Scale(f, from_=0, to=150, orient="horizontal", length=200, variable=v["volume"],
-                 command=lambda x: self._set_out(i, "volume", int(float(x)))).grid(row=2, column=1)
-        ttk.Label(f, text="Delay ms").grid(row=3, column=0, sticky="w")
-        tk.Scale(f, from_=0, to=MAX_DELAY, orient="horizontal", length=200, variable=v["delay"],
-                 command=lambda x: self._set_out(i, "delay", int(float(x)))).grid(row=3, column=1)
-        ttk.Label(f, text="Channel").grid(row=4, column=0, sticky="w")
-        mo = ttk.Combobox(f, textvariable=v["mode"], values=MODES, state="readonly", width=20)
-        mo.grid(row=4, column=1, sticky="w", pady=4)
-        mo.bind("<<ComboboxSelected>>", lambda e: self._set_out(i, "mode", v["mode"].get()))
-
-    # --- state changes from the window
-    def _set_top(self, key, value, restart=False):
-        with state_lock:
-            state[key] = value
-        self.dirty = True
-        if restart and self.engine.running:
-            self.start()
-
-    def _set_out(self, i, key, value, restart=False):
-        with state_lock:
-            state["outputs"][i][key] = value
-        self.dirty = True
-        if restart and self.engine.running:
-            self.start()
-
-    # --- devices
-    def refresh_devices(self):
-        self.sources, self.mics = {}, {}
+def fatal(msg):
+    if sys.platform == "win32":
         try:
-            for m in sc.all_microphones(include_loopback=True):
-                if getattr(m, "isloopback", False):
-                    self.sources["System audio of: " + m.name] = m
-                else:
-                    self.sources["Input: " + m.name] = m
-                    if "CABLE" not in m.name:
-                        self.mics[m.name] = m
-            self.speakers = {s.name: s for s in sc.all_speakers()}
-        except Exception as e:
-            self.messagebox.showerror("Device error", str(e))
-        self.src_box["values"] = list(self.sources)
-        self.mic_box["values"] = list(self.mics)
-        for v in self.vars:
-            v["box"]["values"] = list(self.speakers)
-        if not self.src_var.get():
-            cable = [k for k in self.sources if "CABLE Output" in k]
-            if cable:
-                self.src_var.set(cable[0])
-                self._set_top("source", cable[0])
-        if not self.mic_var.get() and self.mics:
-            try:
-                name = sc.default_microphone().name
-            except Exception:
-                name = ""
-            pick = name if name in self.mics else list(self.mics)[0]
-            self.mic_var.set(pick)
-            self._set_top("mic", pick)
-
-    # --- engine control
-    def toggle(self):
-        if self.engine.running:
-            self.stop()
-        else:
-            self.start()
-
-    def start(self):
-        with state_lock:
-            src = state["source"]
-            outs = [dict(o) for o in state["outputs"]]
-        mic = self.sources.get(src)
-        if mic is None:
-            self._status("Pick what to play first (top box).")
+            ctypes.windll.user32.MessageBoxW(None, msg, "Dual Speaker", 0x10)
             return
-        targets, used = [], set()
-        for i, o in enumerate(outs):
-            spk = self.speakers.get(o["device"])
-            if spk is None or o["device"] in used:
-                continue
-            if (getattr(mic, "isloopback", False) and mic.name == spk.name) or (
-                    "CABLE Input" in spk.name and "CABLE Output" in mic.name):
-                self._status(f"Speaker {i + 1} is the same device you're capturing from - that would echo forever. "
-                             "Pick a different source (see the README).")
-                return
-            used.add(o["device"])
-            targets.append((i, spk))
-        if not targets:
-            self._status("Pick at least one speaker.")
-            return
-        self.engine.start(mic, targets)
-        with state_lock:
-            state["running"] = True
-        self.run_btn.config(text="Stop")
-
-    def stop(self):
-        self.engine.stop()
-        with state_lock:
-            state["running"] = False
-        self.run_btn.config(text="Start")
-
-    def calibrate(self):
-        with state_lock:
-            mic = self.mics.get(state["mic"])
-        if mic is None:
-            return self._calib_msg("Pick a calibration mic first (use the laptop's own mic, not a Bluetooth one).")
-        if not self.engine.running:
-            return self._calib_msg("Press Start first, with both speakers picked.")
-        self._calib_msg("Calibrating... you'll hear chirps for about 10 seconds. Keep the room quiet.")
-
-        def job():
-            res = self.engine.calibrate(mic)
-            self._calib_msg(res["msg"])
-            self.dirty = True
-        threading.Thread(target=job, daemon=True).start()
-
-    def _calib_msg(self, text):
-        with state_lock:
-            state["calib"] = text
-
-    def _status(self, text):
-        with state_lock:
-            state["status"] = text
-        self.status.config(text=text)
-
-    # --- web remote
-    def _start_web(self):
-        try:
-            start_web()
-            self.web_label.config(text=f"Phone remote (same Wi-Fi): http://{local_ip()}:{WEB_PORT}")
-        except OSError as e:
-            self.web_label.config(text=f"Phone remote off: {e}")
-
-    # --- keep window, phone and engine in step
-    def poll(self):
-        with state_lock:
-            pending, state["pending"] = state["pending"], None
-            snap = {k: state[k] for k in ("master", "sync_test", "calib")}
-            outs = [dict(o) for o in state["outputs"]]
-        if pending == "start" and not self.engine.running:
-            self.start()
-        elif pending == "stop" and self.engine.running:
-            self.stop()
-        elif pending == "calibrate":
-            self.calibrate()
-
-        if self.master_var.get() != snap["master"]:
-            self.master_var.set(snap["master"])
-        if self.sync_var.get() != snap["sync_test"]:
-            self.sync_var.set(snap["sync_test"])
-        self.cal_label.config(text=snap["calib"])
-        for v, o in zip(self.vars, outs):
-            for k in ("enabled", "volume", "mode", "delay", "muted"):
-                if v[k].get() != o[k]:
-                    v[k].set(o[k])
-
-        errs = self.engine.errors()
-        was_running = state["running"]
-        if was_running and not self.engine.running:
-            with state_lock:
-                state["running"] = False
-            self.run_btn.config(text="Start")
-        if errs:
-            self._status("Problem: " + " | ".join(errs))
-        elif self.engine.running:
-            parts = []
-            for w in self.engine.workers:
-                parts.append(f"{outs[w.idx]['device']} (drift fix {w.drift_ppm:+.0f} ppm)")
-            self._status("Playing to: " + ", ".join(parts))
-        elif not was_running and not state["status"].startswith(("Pick", "Speaker")):
-            self._status("Stopped")
-
-        if self.dirty:
-            save_settings()
-            self.dirty = False
-        self.root.after(250, self.poll)
-
-    def on_close(self):
-        save_settings()
-        self.engine.stop()
-        self.root.destroy()
+        except Exception:
+            pass
+    print(msg)
 
 
 def main():
-    import tkinter as tk
-    from tkinter import ttk, messagebox
+    global CTRL
     load_settings()
-    root = tk.Tk()
-    App(root, tk, ttk, messagebox)
-    root.mainloop()
+    CTRL = Controller()
+    url = f"http://127.0.0.1:{WEB_PORT}"
+    try:
+        srv = start_web()
+    except OSError:
+        open_window(url)   # already running: just show its window
+        return
+    CTRL.remote = f"http://{local_ip()}:{WEB_PORT}"
+    CTRL.refresh_devices()
+    open_window(url)
+    try:
+        CTRL.run_loop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        CTRL.shutdown()
+        srv.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # windowed exe has no console: show the error
+        fatal(f"Dual Speaker stopped because of an error:\n\n{e!r}")
