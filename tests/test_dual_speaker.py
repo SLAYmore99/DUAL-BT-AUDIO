@@ -88,7 +88,8 @@ class FakeDevice:
 
 
 DEVICES = {
-    "mics": [FakeDevice("CABLE Output (VB-Audio Virtual Cable)"), FakeDevice("Microphone Array (Realtek)")],
+    "mics": [FakeDevice("CABLE Output (VB-Audio Virtual Cable)"), FakeDevice("Headset (Portronics TriFusion)"),
+             FakeDevice("Microphone Array (Realtek)")],
     "loop": [FakeDevice("Speakers (Realtek)", True)],
     "spk": [FakeDevice("JBL Flip 5"), FakeDevice("boAt Stone 350"), FakeDevice("CABLE Input (VB-Audio Virtual Cable)"),
             FakeDevice("Speakers (Realtek)")],
@@ -97,7 +98,7 @@ fake_sc = types.ModuleType("soundcard")
 fake_sc.SoundcardRuntimeWarning = RuntimeWarning
 fake_sc.all_microphones = lambda include_loopback=False: (DEVICES["loop"] if include_loopback else []) + DEVICES["mics"]
 fake_sc.all_speakers = lambda: DEVICES["spk"]
-fake_sc.default_microphone = lambda: DEVICES["mics"][1]
+fake_sc.default_microphone = lambda: DEVICES["mics"][1]   # Windows made the BT speaker's mic the default
 sys.modules["soundcard"] = fake_sc
 
 import dual_speaker as ds  # noqa: E402
@@ -357,7 +358,7 @@ def test_web_remote():
     base = f"http://127.0.0.1:{port}"
     try:
         html = urllib.request.urlopen(base + "/").read().decode()
-        assert "Dual Speaker" in html and "Auto-calibrate" in html
+        assert "Dual Speaker" in html and "Line up by ear" in html
 
         def post(path, body):
             req = urllib.request.Request(base + path, json.dumps(body).encode(),
@@ -414,6 +415,7 @@ def test_controller_flow():
         assert ds.state["source"] == "Input: CABLE Output (VB-Audio Virtual Cable)"
         assert ds.state["mic"] == "Microphone Array (Realtek)"
         assert "CABLE Output (VB-Audio Virtual Cable)" not in c.mics
+        assert "Headset (Portronics TriFusion)" not in c.mics       # BT hands-free mic never offered
         assert not c.public_state()["needs_cable"]
         c.command("start")
         assert ds.state["status"] == "Pick at least one speaker."
@@ -448,6 +450,73 @@ def test_controller_flow():
         c.command("calibrate")
         assert "Press Start" in ds.state["calib"]
     finally:
+        c.shutdown()
+
+
+def test_usable_mic():
+    assert ds.usable_mic("Microphone Array (Realtek(R) Audio)")
+    assert ds.usable_mic("Microphone (USB Audio Device)")
+    for bad in ("Headset (Portronics TriFusion)", "Headset Microphone (Philips TAS2400 Hands-Free AG Audio)",
+                "CABLE Output (VB-Audio Virtual Cable)", "Hands-Free (JBL Flip 5)"):
+        assert not ds.usable_mic(bad), bad
+
+
+def test_saved_bluetooth_mic_is_replaced():
+    reset_state()
+    ds.state["mic"] = "Headset (Portronics TriFusion)"       # what v0.3 saved on Rachit's PC
+    ds.save_settings = lambda path=None: None
+    c = ds.Controller()
+    c.refresh_devices()
+    assert ds.state["mic"] == "Microphone Array (Realtek)"
+
+
+def test_line_up_by_ear():
+    c = make_controller()
+    try:
+        c.set(["sync_test"], True)                             # not running yet
+        assert not ds.state["sync_test"] and "Press Start" in ds.state["calib"]
+        c.set(["outputs", 0, "device"], "JBL Flip 5")
+        c.set(["outputs", 1, "device"], "boAt Stone 350")
+        c.command("start")
+        c.set(["sync_test"], True)
+        assert ds.state["sync_test"]
+        c.set(["offset"], 155)
+        assert (ds.state["outputs"][0]["delay"], ds.state["outputs"][1]["delay"]) == (155, 0)
+        c.set(["offset"], -40)
+        assert (ds.state["outputs"][0]["delay"], ds.state["outputs"][1]["delay"]) == (0, 40)
+        c.set(["offset"], 99999)
+        assert ds.state["outputs"][0]["delay"] == ds.MAX_DELAY
+        c.set(["offset"], "junk")
+        assert ds.state["outputs"][0]["delay"] == ds.MAX_DELAY
+        # the tick reaches the speakers while sync test is on (music muted)
+        time.sleep(1.2)
+        y = np.concatenate(c.engine.workers[1].speaker.played[-60:])[:, 0]
+        assert np.max(np.abs(y)) > 0.2
+        quiet = np.abs(y) < 1e-6
+        assert quiet.mean() > 0.9                              # mostly silence between ticks
+    finally:
+        c.shutdown()
+
+
+def test_diagnostics_log():
+    import tempfile
+    c = make_controller()
+    old_here = ds.HERE
+    ds.HERE = tempfile.mkdtemp()
+    try:
+        c.set(["outputs", 0, "device"], "JBL Flip 5")
+        c.set(["outputs", 1, "device"], "boAt Stone 350")
+        c.command("start")
+        time.sleep(1.0)
+        c.write_stats()
+        c.command("stop")
+        text = open(os.path.join(ds.HERE, "dual_speaker_log.txt"), encoding="utf-8").read()
+        assert "START v" in text and "STATS capture" in text and "S1 'JBL Flip 5'" in text and "STOP" in text
+        line = [l for l in text.splitlines() if "STATS" in l][0]
+        rate = float(line.split("capture ")[1].split(" Hz")[0])
+        assert 30000 < rate < 70000, line
+    finally:
+        ds.HERE = old_here
         c.shutdown()
 
 
@@ -514,6 +583,17 @@ def test_ui_in_headless_browser():
             page.click("#mu1")
             page.wait_for_timeout(700)
             page.screenshot(path=os.path.join(shots, "desktop.png"), full_page=True)
+            page.click("#ear")
+            page.wait_for_selector("#earbox", state="visible")
+            page.click("#earbox button[data-d='10']")
+            page.wait_for_timeout(600)
+            page.click("#earbox button[data-d='10']")
+            page.wait_for_timeout(600)
+            assert ds.state["outputs"][0]["delay"] == 20, ds.state["outputs"]
+            page.screenshot(path=os.path.join(shots, "by-ear.png"), full_page=True)
+            page.click("#earok")
+            page.wait_for_selector("#earbox", state="hidden")
+            assert not ds.state["sync_test"]
             m = b.new_page(viewport={"width": 390, "height": 844}, device_scale_factor=2)
             m.goto(url.replace("127.0.0.1", "localhost"))
             m.wait_for_selector("#dev1")

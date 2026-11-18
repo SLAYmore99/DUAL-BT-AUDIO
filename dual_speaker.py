@@ -16,7 +16,7 @@ volume, mute, on/off, channel (stereo / left / right / mono / swap) and delay.
 Windows 10/11. Run DualSpeaker.exe, or with Python 3.9+:  pip install soundcard numpy
 Ideas credited in README.md (erdongshuiyang/DualSpeaker, MIT).
 """
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 import ctypes
 import json
@@ -44,7 +44,8 @@ SR = 48000            # sample rate used everywhere
 BLOCK = 960           # 20 ms per block
 DEV_BUF = SR // 10    # 100 ms device buffer: absorbs Python timing hiccups without crackles
 RING_S = 12           # seconds kept in the shared buffer
-LATENCY_MS = 60       # how far behind the newest captured audio each speaker reads
+LATENCY_MS = 150      # how far behind the newest captured audio each speaker reads (safety margin
+                      # against PC hiccups; 60 ms was too tight on a real laptop)
 MAX_DELAY = 1000      # ms, per-speaker delay range
 MAX_CORR = 0.002      # max speed change for drift correction (0.2 %)
 KP = 0.05             # drift correction: proportional gain (per second of error)
@@ -61,12 +62,40 @@ MODES = ["Stereo", "Left channel only", "Right channel only", "Mono (L+R)", "Swa
 
 
 def com_init():
-    """Each audio thread on Windows needs COM initialised."""
+    """Each audio thread on Windows needs COM initialised. Also ask Windows to schedule
+    it as a "Pro Audio" thread (MMCSS), so busy moments don't starve the audio."""
     if sys.platform == "win32":
         try:
             ctypes.windll.ole32.CoInitializeEx(None, 0)
         except Exception:
             pass
+        try:
+            task = ctypes.c_ulong(0)
+            ctypes.windll.avrt.AvSetMmThreadCharacteristicsW("Pro Audio", ctypes.byref(task))
+        except Exception:
+            pass
+
+
+BT_MIC_WORDS = ("headset", "hands-free", "hands free", "ag audio", "cable")
+
+
+def usable_mic(name):
+    """Bluetooth speaker/headphone mics are excluded: opening one switches that device into
+    low-quality hands-free (call) mode, which garbles its sound and breaks calibration."""
+    n = name.lower()
+    return not any(w in n for w in BT_MIC_WORDS)
+
+
+def log(line):
+    """Diagnostics log next to the app (dual_speaker_log.txt), rotated at 2 MB."""
+    path = os.path.join(HERE, "dual_speaker_log.txt")
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 2_000_000:
+            os.replace(path, path + ".old")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------- shared state
@@ -128,12 +157,18 @@ def apply_mode(x, mode):
     return x
 
 
+# Sync-test tick: short and sharp (easy to hear whether it's one tick or two).
+TICK_LEN = int(0.004 * SR)
+_tt = np.arange(TICK_LEN) / SR
+TICK = (0.7 * np.exp(-_tt / 0.0008) * (np.sin(2 * np.pi * 3000 * _tt) + 0.6 * np.sin(2 * np.pi * 5200 * _tt)) / 1.6
+        ).astype(np.float32)
+
 # Calibration chirps: each speaker gets its own frequency band so one mic recording
 # can tell them apart; irregular gaps so the pattern can't line up with itself.
 CHIRP_LEN = 0.09
 CHIRP_OFFSETS = (0.0, 0.73, 1.61, 2.67, 3.91, 5.23)
 CHIRP_BANDS = ((850.0, 1850.0), (2300.0, 3700.0))
-CHIRP_LEVEL = 0.35
+CHIRP_LEVEL = 0.6
 
 
 def chirp(idx, t):
@@ -191,9 +226,17 @@ def measure_offset(rec):
     deltas = (peaks[1] - peaks[0]) * 1000.0 / SR
     diff = float(np.median(deltas))
     spread = float(np.median(np.abs(deltas - diff)))
-    valid = min(scores) > 6.0 and spread < 3.0
-    msg = (f"Speaker 2 is {diff:+.0f} ms vs speaker 1 (spread {spread:.1f} ms)" if valid else
-           "Couldn't hear both speakers clearly. Turn them up, put the mic between them, keep the room quiet.")
+    heard = [sc_ > 4.0 for sc_ in scores]
+    valid = all(heard) and spread < 4.0
+    if valid:
+        msg = f"Speaker 2 is {diff:+.0f} ms vs speaker 1 (spread {spread:.1f} ms)"
+    elif not any(heard):
+        msg = "The mic didn't hear either speaker. Turn them up and put the laptop between them, or use Line up by ear."
+    elif not all(heard):
+        msg = (f"The mic couldn't hear speaker {heard.index(False) + 1}. Turn it up or move it closer to the laptop, "
+               "or use Line up by ear.")
+    else:
+        msg = "Too much echo or noise to measure reliably. Try again in a quieter spot, or use Line up by ear."
     return {"valid": valid, "diff_ms": diff, "spread_ms": spread, "scores": scores, "msg": msg}
 
 
@@ -215,6 +258,7 @@ class Ring:
         self.buf = np.zeros((self.cap, 2), np.float32)
         self.written = 0
         self.last_t = None
+        self.max_gap = 0.0
         self.clock = time.perf_counter
         self.lock = threading.Lock()
 
@@ -240,7 +284,10 @@ class Ring:
             if first < n:
                 self.buf[:n - first] = data[first:]
             self.written += n
-            self.last_t = self.clock()
+            now = self.clock()
+            if self.last_t is not None:
+                self.max_gap = max(self.max_gap, now - self.last_t)
+            self.last_t = now
 
     def read_at(self, pos, step, frames):
         p = pos + np.arange(frames) * step
@@ -276,6 +323,10 @@ class OutputWorker(threading.Thread):
         self.resyncs = 0
         self.played = 0
         self.level = 0.0
+        self.glitches = 0        # blocks with a hole in them (would click)
+        self.late = 0            # calls that came so late the device buffer likely ran dry
+        self.max_call_gap = 0.0
+        self.last_call = None
 
     def run(self):
         com_init()
@@ -295,6 +346,7 @@ class OutputWorker(threading.Thread):
         the timeline once play() starts pacing us at the speaker's real rate."""
         self.position = None
         self.prefill = DEV_BUF
+        self.last_call = None
         self.starving = False
         self.err_f = 0.0
 
@@ -306,6 +358,13 @@ class OutputWorker(threading.Thread):
         """Next BLOCK frames for this speaker. play() blocks while the device buffer is
         full, so this is called at the speaker's own clock rate."""
         ring = self.engine.ring
+        now = time.perf_counter()
+        if self.last_call is not None and self.prefill <= 0:
+            gap = now - self.last_call
+            self.max_call_gap = max(self.max_call_gap, gap)
+            if gap > 0.9 * DEV_BUF / SR:
+                self.late += 1
+        self.last_call = now
         if self.prefill > 0:
             self.prefill -= BLOCK
             self.level = 0.0
@@ -343,6 +402,8 @@ class OutputWorker(threading.Thread):
         self.drift_ppm, self.lag_ms = corr * 1e6, lag * 1000.0 / SR
         out, missing = ring.read_at(self.position, step, BLOCK)
         self.missing += missing
+        if missing:
+            self.glitches += 1
         cs = self.engine.calib_start
         if cs is not None:  # calibration: chirps on the same timeline, music muted
             t = (self.position + np.arange(BLOCK) * step - cs) / SR
@@ -421,10 +482,11 @@ class Engine:
         with state_lock:
             on = state["sync_test"]
         if on:
-            mask = (idx % (SR // 2)) < 480
             data = np.zeros_like(data)
+            ph = idx % (SR // 2)
+            mask = ph < TICK_LEN
             if mask.any():
-                data[mask] = (0.5 * np.sin(2 * np.pi * 1000 * idx[mask] / SR))[:, None]
+                data[mask] = TICK[ph[mask]][:, None]
         return data
 
     def calibrate(self, mic, record_fn=None):
@@ -519,6 +581,9 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--dim);font-size:13px;u
 .sw{position:relative;width:42px;height:24px;border-radius:24px;background:var(--line);border:0;padding:0;flex:none}
 .sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s}
 .sw.on{background:var(--acc)}.sw.on::after{left:21px}
+.earbox{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-top:12px}
+.earbox .bar button{padding:6px 10px}
+h2{font-size:14px;margin:4px 0 10px;font-weight:600}
 </style></head><body><div class="wrap">
 <header><div class="logo">2</div><h1>Dual Speaker <span class="small" id="ver"></span></h1><div class="grow"></div>
 <button id="quit" class="small" style="display:none" title="Stop audio and close the app">Quit</button>
@@ -529,13 +594,22 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--dim);font-size:13px;u
 <div class="grid" id="outs"></div>
 <div class="card" style="margin-top:14px">
 <div class="row"><label>Master</label><input id="master" type="range" min="0" max="100"><span class="val" id="masterv"></span></div>
-<div class="bar"><button id="cal">Auto-calibrate delay</button><span class="small">Plays chirps for ~10 s, the laptop mic lines both speakers up.</span></div>
+<h2>Line the speakers up</h2>
+<div class="bar"><button id="ear">Line up by ear</button><button id="cal">Auto (laptop mic)</button>
+<span class="small">By ear works everywhere; Auto needs the laptop's own mic to hear both speakers.</span></div>
+<div id="earbox" class="earbox" style="display:none">
+<p class="small" style="margin:0 0 4px">Both speakers now tick twice a second (music is muted). Move the slider until you hear
+<b>one</b> tick instead of two, then fine-tune with the small buttons.</p>
+<div class="row"><label>Offset</label><input id="off" type="range" min="-1000" max="1000" step="1"><span class="val" id="offv"></span></div>
+<div class="bar"><span class="small" id="offtxt"></span><span class="grow"></span>
+<button data-d="-10">&minus;10</button><button data-d="-1">&minus;1</button><button data-d="1">+1</button><button data-d="10">+10</button>
+<button id="earok" class="primary" style="padding:8px 18px">Done</button></div></div>
 <div class="msg" id="calmsg"></div>
 <details id="setup"><summary>Setup</summary>
 <div class="row"><label>Play</label><select id="source"></select></div>
 <div class="row"><label>Mic</label><select id="mic"></select></div>
-<div class="bar"><button id="refresh">Refresh devices</button>
-<span class="bar"><button id="sync" class="sw" aria-label="Sync test"></button><span class="small">Sync test (beeps, music muted)</span></span></div>
+<div class="bar"><button id="refresh">Refresh devices</button></div>
+<p class="small" id="diag"></p>
 <p class="small" id="remote"></p>
 </details></div>
 </div>
@@ -546,7 +620,9 @@ const $=id=>document.getElementById(id);
 function post(u,b){return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(poll)}
 function set(path,value){return post("/set",{path,value})}
 function cmd(c){return post("/cmd",{cmd:c})}
-function paint(el){const p=(el.value-el.min)/(el.max-el.min)*100;el.style.background=`linear-gradient(90deg,var(--acc) ${p}%,var(--line) ${p}%)`}
+function paint(el){const p=(el.value-el.min)/(el.max-el.min)*100;
+ if(+el.min<0){const a=Math.min(p,50),b=Math.max(p,50);el.style.background=`linear-gradient(90deg,var(--line) ${a}%,var(--acc) ${a}%,var(--acc) ${b}%,var(--line) ${b}%)`;return}
+ el.style.background=`linear-gradient(90deg,var(--acc) ${p}%,var(--line) ${p}%)`}
 document.addEventListener("input",e=>{if(e.target.type==="range")paint(e.target)});
 function hold(el){el.addEventListener("pointerdown",()=>busy++);el.addEventListener("pointerup",()=>setTimeout(()=>busy=Math.max(0,busy-1),300));}
 function fill(sel,items,value,blank){const want=JSON.stringify([items,value]);if(sel.dataset.k===want||document.activeElement===sel)return;sel.dataset.k=want;
@@ -573,8 +649,10 @@ function render(){
  const st=$("status");st.textContent=S.status;st.classList.toggle("bad",/^Problem|echo|Pick/.test(S.status));
  $("quit").style.display=S.local?"":"none";$("ver").textContent=S.version?("v"+S.version):"";
  $("hint").style.display=S.needs_cable?"":"none";
- $("calmsg").textContent=S.calib;$("cal").disabled=S.calibrating;$("cal").textContent=S.calibrating?"Calibrating…":"Auto-calibrate delay";
- $("sync").classList.toggle("on",S.sync_test);
+ $("calmsg").textContent=S.calib;$("cal").disabled=S.calibrating;$("cal").textContent=S.calibrating?"Listening…":"Auto (laptop mic)";
+ $("earbox").style.display=S.sync_test?"":"none";$("ear").classList.toggle("on",S.sync_test);
+ const off=S.outputs[0].delay-S.outputs[1].delay;if(!busy)$("off").value=off;paint($("off"));offLabel(off);
+ $("diag").textContent=S.running?("Sound check: "+S.glitches.map((g,i)=>g===null?null:`Speaker ${i+1} ${g} glitch${g===1?"":"es"}`).filter(Boolean).join(" · ")+" (details: dual_speaker_log.txt next to the app)"):"";
  if(!busy)$("master").value=S.master;paint($("master"));$("masterv").textContent=S.master+"%";
  fill($("source"),S.devices.sources,S.source,"Choose what to play…");fill($("mic"),S.devices.mics,S.mic,"Choose a mic…");
  $("remote").textContent=S.remote?("Phone remote (same Wi-Fi): "+S.remote):"";
@@ -594,7 +672,13 @@ $("toggle").onclick=()=>cmd(S&&S.running?"stop":"start");
 $("cal").onclick=()=>cmd("calibrate");
 $("refresh").onclick=()=>cmd("refresh");
 $("quit").onclick=()=>{cmd("quit");document.body.innerHTML='<div class="wrap"><h1>Dual Speaker closed</h1><p class="small">You can close this window.</p></div>'};
-$("sync").onclick=()=>set(["sync_test"],!S.sync_test);
+function offLabel(v){$("offv").textContent=(v>0?"+":"")+v+" ms";
+ $("offtxt").textContent=v>0?`Speaker 1 waits ${v} ms`:v<0?`Speaker 2 waits ${-v} ms`:"No delay on either speaker";}
+const off=$("off");hold(off);off.oninput=()=>{offLabel(+off.value);set(["offset"],+off.value)};
+document.querySelectorAll("#earbox button[data-d]").forEach(b=>b.onclick=()=>{
+ const v=Math.max(-1000,Math.min(1000,(S.outputs[0].delay-S.outputs[1].delay)+(+b.dataset.d)));set(["offset"],v)});
+$("ear").onclick=()=>set(["sync_test"],!S.sync_test);
+$("earok").onclick=()=>set(["sync_test"],false);
 $("source").onchange=e=>set(["source"],e.target.value);
 $("mic").onchange=e=>set(["mic"],e.target.value);
 addEventListener("pagehide",()=>navigator.sendBeacon("/cmd",JSON.stringify({cmd:"bye"})));
@@ -638,6 +722,10 @@ class Controller:
         self.bye_at = None
         self.remote = ""
         self.cal_thread = None
+        self.next_log = 0.0
+        self.last_written = (0, time.perf_counter())
+        self.last_err = ""
+        self.prev = {}
 
     # --- devices
     def refresh_devices(self):
@@ -648,7 +736,7 @@ class Controller:
                     sources["System audio of: " + m.name] = m
                 else:
                     sources["Input: " + m.name] = m
-                    if "CABLE" not in m.name:
+                    if usable_mic(m.name):
                         mics[m.name] = m
             speakers = {s.name: s for s in sc.all_speakers()}
         except Exception as e:
@@ -664,17 +752,19 @@ class Controller:
                     name = sc.default_microphone().name
                 except Exception:
                     name = ""
-                state["mic"] = name if name in mics else (next(iter(mics)) if mics else "")
+                built_in = [k for k in mics if any(w in k.lower() for w in ("array", "realtek", "intel", "internal"))]
+                state["mic"] = name if name in mics else (built_in or list(mics) or [""])[0]
         self.dirty = True
 
     def public_state(self, local=False):
         with state_lock:
             pub = {k: state[k] for k in ("master", "running", "status", "sync_test", "calib", "source", "mic")}
             pub["outputs"] = [dict(o) for o in state["outputs"]]
-        levels = [0.0] * N_OUT
+        levels, glitches = [0.0] * N_OUT, [None] * N_OUT
         for w in self.engine.workers:
             levels[w.idx] = round(float(getattr(w, "level", 0.0)), 3)
-        pub.update(version=__version__, levels=levels, local=local, remote=self.remote, calibrating=self.engine.calibrating,
+            glitches[w.idx] = int(w.glitches + w.late)
+        pub.update(version=__version__, levels=levels, glitches=glitches, local=local, remote=self.remote, calibrating=self.engine.calibrating,
                    needs_cable=not any("CABLE Output" in k for k in self.sources),
                    devices={"sources": list(self.sources), "speakers": list(self.speakers), "mics": list(self.mics)})
         return pub
@@ -682,6 +772,18 @@ class Controller:
     # --- changes from the UI
     def set(self, path, value):
         restart = False
+        if path == ["offset"]:   # "Line up by ear": >0 delays speaker 1, <0 delays speaker 2
+            try:
+                v = int(max(-MAX_DELAY, min(MAX_DELAY, int(value))))
+            except (TypeError, ValueError):
+                return
+            with state_lock:
+                state["outputs"][0]["delay"], state["outputs"][1]["delay"] = max(v, 0), max(-v, 0)
+            self.dirty = True
+            return
+        if path == ["sync_test"] and value and not self.engine.running:
+            self._calib("Press Start first, then Line up by ear.")
+            return
         if path in (["source"], ["mic"]) and isinstance(value, str):
             pool = self.sources if path == ["source"] else self.mics
             if value in pool or value == "":
@@ -744,9 +846,17 @@ class Controller:
         self.engine.start(mic, targets)
         with state_lock:
             state["running"] = True
+        log(f"START v{__version__} source={src!r} speakers={[ (i, s.name) for i, s in targets]} "
+            f"mic={state['mic']!r} outputs={outs}")
+        self.next_log = time.time() + 5
+        self.last_written = (0, time.perf_counter())
+        self.prev = {}
         self.tick()
 
     def stop(self):
+        if self.engine.running:
+            self.write_stats()
+            log("STOP")
         self.engine.stop()
         with state_lock:
             state["running"] = False
@@ -765,6 +875,8 @@ class Controller:
 
         def job():
             res = self.engine.calibrate(mic)
+            log(f"CALIBRATE mic={mic.name!r} valid={res.get('valid')} diff_ms={res.get('diff_ms')} "
+                f"spread_ms={res.get('spread_ms')} scores={res.get('scores')} -> {res.get('msg')}")
             self._calib(res["msg"])
             self.dirty = True
         self.cal_thread = threading.Thread(target=job, daemon=True)
@@ -787,6 +899,13 @@ class Controller:
             running = state["running"]
             outs = [dict(o) for o in state["outputs"]]
             status = state["status"]
+        err_text = " | ".join(errs)
+        if err_text and err_text != self.last_err:
+            log("ERROR " + err_text)
+        self.last_err = err_text
+        if running and time.time() >= self.next_log:
+            self.next_log = time.time() + 5
+            self.write_stats()
         if errs:
             self._status("Problem: " + " | ".join(errs))
         elif running:
@@ -799,6 +918,28 @@ class Controller:
             save_settings()
         if self.bye_at is not None and time.time() > self.bye_at:
             self.quit_evt.set()
+
+    def write_stats(self):
+        """One log line: capture health plus each speaker's health since the last line."""
+        ring = self.engine.ring
+        w0, t0 = self.last_written
+        now = time.perf_counter()
+        rate = (ring.written - w0) / max(1e-6, now - t0)
+        self.last_written = (ring.written, now)
+        parts = [f"capture {rate:.0f} Hz maxgap {ring.max_gap * 1000:.0f} ms"]
+        ring.max_gap = 0.0
+        with state_lock:
+            outs = [dict(o) for o in state["outputs"]]
+        for w in self.engine.workers:
+            p = self.prev.get(w.idx, (0, 0, 0))
+            parts.append(f"S{w.idx + 1} {outs[w.idx]['device']!r}: glitch +{w.glitches - p[0]} late +{w.late - p[1]} "
+                         f"missing +{w.missing - p[2]} maxcall {w.max_call_gap * 1000:.0f} ms lag {w.lag_ms:.0f} ms "
+                         f"drift {w.drift_ppm:+.0f} ppm resyncs {w.resyncs} level {w.level:.2f} "
+                         f"vol {outs[w.idx]['volume']} delay {outs[w.idx]['delay']}"
+                         f"{' OFF' if not outs[w.idx]['enabled'] else ''}{' MUTED' if outs[w.idx]['muted'] else ''}")
+            self.prev[w.idx] = (w.glitches, w.late, w.missing)
+            w.max_call_gap = 0.0
+        log("STATS " + " | ".join(parts))
 
     def run_loop(self):
         while not self.quit_evt.wait(0.25):
@@ -906,7 +1047,13 @@ def main():
         open_window(url)   # already running: just show its window
         return
     CTRL.remote = f"http://{local_ip()}:{WEB_PORT}"
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)   # 1 ms timer: steadier audio thread wake-ups
+        except Exception:
+            pass
     CTRL.refresh_devices()
+    log(f"APP v{__version__} sources={list(CTRL.sources)} speakers={list(CTRL.speakers)} mics={list(CTRL.mics)}")
     open_window(url)
     try:
         CTRL.run_loop()
